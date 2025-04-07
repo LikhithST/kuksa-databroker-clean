@@ -15,10 +15,13 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::pin::Pin;
-
+use std::fs::OpenOptions;
+use std::io::Write;
 #[cfg(feature = "stats")]
 use chrono::Utc;
-
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+use serde::{Deserialize, Serialize};
 use databroker_proto::kuksa::val::v1 as proto;
 use databroker_proto::kuksa::val::v1::DataEntryError;
 use tokio_stream::Stream;
@@ -31,6 +34,129 @@ use crate::broker::ReadError;
 use crate::broker::SubscriptionError;
 use crate::glob;
 use crate::permissions::Permissions;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VectorClock {
+    timestamp: String,
+    process_name: String,
+    vector: std::collections::HashMap<String, i32>,
+}
+
+// Function to merge two vector clocks, retaining the maximum value for each key
+fn merge_vector_clocks(vc1: &mut HashMap<String, i32>, vc2: &HashMap<String, i32>) {
+    println!("vc1{:?}",vc1);
+    println!("vc2{:?}",vc2);
+
+    for (key, &value) in vc2 {
+        println!("{:?}",key);
+        let entry = vc1.entry(key.clone()).or_insert(value);
+        *entry = (*entry).max(value);
+
+    }
+}
+
+// Function to process the incoming request and update the vector clock
+fn process_request(description: &str, file_name: &str) -> io::Result<String> {
+    // Read the last vector clock from the file
+    let mut last_vector_clock = match read_last_vector_clock(file_name) {
+        Ok(vc) => vc,
+        Err(e) => {
+            eprintln!("Error reading last vector clock: {}", e);
+            return Err(e); // Return the error
+        }
+    };
+
+    // Parse the incoming description to get the new vector clock (vc2)
+    let vc2: VectorClock = match serde_json::from_str(description) {
+        Ok(vc) => vc,
+        Err(e) => {
+            eprintln!("Error parsing description: {}", e);
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid description"));
+        }
+    };
+
+    println!("vc2------{:?}",vc2);
+    println!("last_vector_clock------{:?}",last_vector_clock);
+
+    // Increment the "kdb_set" key in the last vector clock
+    increment_kdb_set(&mut last_vector_clock);
+
+    // Merge the new vector clock with the previous one, retaining the maximum values for each key
+    last_vector_clock.process_name = vc2.process_name;
+    last_vector_clock.timestamp = vc2.timestamp;
+    merge_vector_clocks(&mut last_vector_clock.vector, &vc2.vector);
+
+    // Write the updated vector clock back to the file
+    let file = OpenOptions::new().create(true).append(true).open(file_name)?;
+    let mut writer = io::BufWriter::new(file);
+    let serialized_vector_clock = serde_json::to_string(&last_vector_clock)?;
+
+    writeln!(writer, "{}", serialized_vector_clock)?;
+
+    Ok(serialized_vector_clock)
+}
+
+fn read_last_vector_clock(file_name: &str) -> io::Result<VectorClock> {
+    let file = OpenOptions::new().read(true).open(file_name);
+
+    // Check if the file exists and is not empty
+    let mut last_vector_clock = VectorClock {
+        timestamp: String::from(""),
+        process_name: String::from(""),
+        vector: HashMap::new(),
+    };
+
+    match file {
+        Ok(file) => {
+            let reader = io::BufReader::new(file);
+            let mut last_line = String::new();
+            // Iterate through all lines to get the last one
+            for line_result in reader.lines() {
+                last_line = line_result?;
+            }
+
+            // If the file is not empty, deserialize the last line into a VectorClock
+            if !last_line.is_empty() {
+                last_vector_clock = serde_json::from_str(&last_line)?;
+            }
+        }
+        Err(_) => {
+            // If the file doesn't exist, it's safe to create an empty vector clock
+            println!("File not found, initializing a new VectorClock.");
+        }
+    }
+
+    Ok(last_vector_clock)
+}
+
+// Function to increment the "kdb_set" key in the vector clock
+fn increment_kdb_set(vector_clock: &mut VectorClock) {
+    *vector_clock.vector.entry("kdb_set".to_string()).or_insert(0) += 1;
+}
+
+fn update_description(
+    mut request: tonic::Request<proto::SetRequest>,
+    file_name: &str,
+) -> tonic::Request<proto::SetRequest> {
+    let inner_request = request.get_mut();
+
+    for update in &mut inner_request.updates {
+        if let Some(entry) = &mut update.entry {
+            if let Some(metadata) = &mut entry.metadata {
+                if let Some(description) = &metadata.description {
+                    let new_description = match process_request(description, file_name) {
+                        Ok(new_desc) => Some(new_desc),
+                        Err(_err) => Some("err".to_string()),
+                    };
+                    metadata.description = new_description;
+                }
+            }
+        }
+    }
+
+    request
+}
+
 
 #[tonic::async_trait]
 impl proto::val_server::Val for broker::DataBroker {
@@ -357,9 +483,48 @@ impl proto::val_server::Val for broker::DataBroker {
     #[cfg(feature="stats")]
     async fn set(
         &self,
-        request: tonic::Request<proto::SetRequest>,
+        mut request: tonic::Request<proto::SetRequest>,
     ) -> Result<tonic::Response<proto::SetResponse>, tonic::Status> {
+        
+            let file_name = "vector_clock_kdb_set.txt"; // File where the vector clocks are stored
+
             
+
+            request= update_description(request, file_name);
+
+    //         let updated_updates: Vec<proto::EntryUpdate> = inner_request
+    //     .updates
+    //     .iter()
+    //     .map(|update| {
+    //         let mut modified_update = update.clone(); // Clone original EntryUpdate
+
+    //         if let Some(entry) = &mut modified_update.entry {
+    //             if let Some(metadata) = &mut entry.metadata {
+    //                 metadata.description = new_description.clone(); // Assign new value
+    //             }
+    //         }
+    //         modified_update
+    //     })
+    //     .collect();
+
+    // // Construct a new SetRequest
+    // let request = tonic::Request::new(proto::SetRequest {
+    //     updates: updated_updates,
+    //     ..inner_request.clone() // Preserve other fields
+    // });
+
+
+            
+
+            // // Extract the description from the request
+            // if let Some(description) = get_description_from_request(&request) {
+            //     // Process the request and update the vector clock
+            // } else {
+            //     println!("No description found in the request.");
+            // }
+
+            
+            debug!(?request);
             let set_enter = match  Utc::now().timestamp_nanos_opt(){
             Some(value) => value.to_string(),
             None => "None".to_string(),
@@ -929,7 +1094,7 @@ impl broker::EntryUpdate {
         // }
 
         // println!("-------{:?}---",datapoint);
-        // println!("------metatata-{:?}---",metadata_des);
+        println!("------metatata-{:?}---",metadata_des);
         Self {
             subscription_id:None,
             path: None,

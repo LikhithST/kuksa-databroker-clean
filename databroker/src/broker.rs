@@ -26,6 +26,11 @@ use std::convert::TryFrom;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+use serde::{Deserialize, Serialize};
 
 use crate::query::{CompiledQuery, ExecutionInput};
 use crate::types::ExecutionInputImplData;
@@ -165,6 +170,127 @@ pub struct ChangeSubscription {
     entries: HashMap<i32, HashSet<Field>>,
     sender: mpsc::Sender<EntryUpdates>,
     permissions: Permissions,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VectorClock {
+    timestamp: String,
+    process_name: String,
+    vector: std::collections::HashMap<String, i32>,
+}
+
+// Function to merge two vector clocks, retaining the maximum value for each key
+fn merge_vector_clocks(vc1: &mut HashMap<String, i32>, vc2: &HashMap<String, i32>) {
+    for (key, &value) in vc2 {
+        let entry = vc1.entry(key.clone()).or_insert(value);
+        *entry = (*entry).max(value);
+    }
+}
+
+// Function to process the incoming request and update the vector clock
+fn process_request(description: &str, file_name: &str) -> io::Result<String> {
+    // Read the last vector clock from the file
+    let mut last_vector_clock = match read_last_vector_clock(description,file_name) {
+        Ok(vc) => vc,
+        Err(e) => {
+            eprintln!("Error reading last vector clock: {}", e);
+            return Err(e); // Return the error
+        }
+    };
+
+    // Parse the incoming description to get the new vector clock (vc2)
+    let vc2: VectorClock = match serde_json::from_str(description) {
+        Ok(vc) => vc,
+        Err(e) => {
+            eprintln!("Error parsing description: {}", e);
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid description"));
+        }
+    };
+
+    // Increment the "kdb_set" key in the last vector clock
+    print!("lastline in process_request {:?}", last_vector_clock);
+    increment_kdb_sub(&mut last_vector_clock);
+
+    // Merge the new vector clock with the previous one, retaining the maximum values for each key
+    merge_vector_clocks(&mut last_vector_clock.vector, &vc2.vector);
+
+    // Write the updated vector clock back to the file
+    let file = OpenOptions::new().create(true).append(true).open(file_name)?;
+    let mut writer = io::BufWriter::new(file);
+    let serialized_vector_clock = serde_json::to_string(&last_vector_clock)?;
+
+    writeln!(writer, "{}", serialized_vector_clock)?;
+
+    Ok(serialized_vector_clock)
+}
+
+fn read_last_vector_clock(description: &str,file_name: &str) -> io::Result<VectorClock> {
+    let file = OpenOptions::new().read(true).open(file_name);
+
+    // Check if the file exists and is not empty
+    let mut last_vector_clock = VectorClock {
+        timestamp: String::from(""),
+        process_name: String::from(""),
+        vector: HashMap::new(),
+    };
+
+    //  last_vector_clock = serde_json::from_str(description).ok().expect("expecting json");
+
+    // last_vector_clock = description.
+
+    match file {
+        Ok(file) => {
+            let reader = io::BufReader::new(file);
+            let mut last_line = String::new();
+            // Iterate through all lines to get the last one
+            for line_result in reader.lines() {
+                last_line = line_result?;
+            }
+
+            // If the file is not empty, deserialize the last line into a VectorClock
+            if !last_line.is_empty() {
+                last_vector_clock = serde_json::from_str(&last_line)?;
+            }
+            else {
+                let last_vector_clock_result = serde_json::from_str::<VectorClock>(description);
+                if let Ok(clock) = last_vector_clock_result {
+                    // Use last_vector_clock here
+                    return Ok(clock);
+                } else {
+                    // Handle failure: maybe log, ignore, or assign default
+                    println!("Failed to parse vector clock, continuing anyway.");
+                }
+                print!("---------------no-effect-------------------------");
+            }
+        }
+        Err(_) => {
+            // If the file doesn't exist, it's safe to create an empty vector clock
+            println!("File not found, initializing a new VectorClock.");
+        }
+    }
+
+    Ok(last_vector_clock)
+}
+
+// Function to increment the "kdb_set" key in the vector clock
+fn increment_kdb_sub(vector_clock: &mut VectorClock) {
+    println!("increment before sub {:?}", vector_clock);
+
+    *vector_clock.vector.entry("kdb_sub".to_string()).or_insert(0) += 1;
+    println!("increment after sub {:?}", vector_clock);
+}
+
+
+pub fn update_entry_description(mut update: EntryUpdate, file_name: &str) -> EntryUpdate {
+    if let Some(description) = &update.description {
+        update.description = match process_request(description, file_name) {
+            Ok(new_desc) => Some(new_desc),
+            Err(_) => Some("err".to_string()),
+        };
+    }
+
+    print!("update inside update_entry_description {:?}",update);
+    update
 }
 
 #[derive(Debug)]
@@ -843,6 +969,8 @@ impl ChangeSubscription {
         db: &Database,
     ) -> Result<(), NotificationError> {
         let db_read = db.authorized_read_access(&self.permissions);
+        let file_name = "vector_clock_kdb_sub.txt"; // File where the vector clocks are stored
+
         match changed {
             Some(changed) => {
                 let mut matches = false;
@@ -884,6 +1012,9 @@ impl ChangeSubscription {
                                             // fill unit field always
                                             update.unit = entry.metadata.unit.clone();
                                             update.description = Some(entry.metadata.description.clone());
+
+                                            update = update_entry_description(update, file_name);
+                                            println!("sub--{:?}", update.description);
 
                                             notifications.updates.push(ChangeNotification {
                                                 update,
@@ -936,6 +1067,14 @@ impl ChangeSubscription {
                                     update.actuator_target = Some(entry.actuator_target.clone());
                                     notify_fields.insert(Field::ActuatorTarget);
                                 }
+
+
+                                println!("sub--{:?}", update.description);
+                                            
+                                        
+                                update = update_entry_description(update, file_name);
+                                println!("sub--{:?}", update.description);
+
                                 notifications.updates.push(ChangeNotification {
                                     update,
                                     fields: notify_fields,
