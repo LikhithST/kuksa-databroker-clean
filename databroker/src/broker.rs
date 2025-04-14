@@ -285,7 +285,12 @@ pub fn update_entry_description(mut update: EntryUpdate, file_name: &str) -> Ent
     if let Some(description) = &update.description {
         update.description = match process_request(description, file_name) {
             Ok(new_desc) => Some(new_desc),
-            Err(_) => Some("err".to_string()),
+            Err(_) => Some(serde_json::to_string(&VectorClock {
+                timestamp: "1111".to_string(),
+                process_name: "kdb_sub".to_string(),
+                vector: HashMap::new(),
+            })
+            .unwrap_or_else(|_| "{\"error\":\"serialization_failed\"}".to_string())),
         };
     }
 
